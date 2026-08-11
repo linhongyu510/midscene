@@ -77,6 +77,142 @@ describe('createReportCliCommands', () => {
     const [command] = createReportCliCommands();
     expect(command.name).toBe('report-tool');
     expect('aliases' in command).toBe(false);
+    expect(command.def.schema).toHaveProperty('reportStatus');
+    expect(command.def.schema).not.toHaveProperty('analysisType');
+  });
+
+  it('generates and renders analysis results through report-tool', async () => {
+    const [command] = createReportCliCommands();
+    const templateResponse = await command.def.handler({
+      action: 'analysis-template',
+      reportStatus: 'fail',
+    });
+    const template = JSON.parse(templateResponse.content[0].text);
+    expect(template.analysisType).toBe('failed_result_analysis');
+    expect(template.resultAssessment).toBe('inconclusive');
+    expect(template.resultAssessmentReason).toBeTruthy();
+
+    const resultPath = join(tmpDir, 'analysis-result.json');
+    const outputPath = join(tmpDir, 'analysis-result.md');
+    writeFileSync(resultPath, JSON.stringify(template), 'utf8');
+    const renderResponse = await command.def.handler({
+      action: 'render-analysis',
+      analysisResultPath: resultPath,
+      analysisOutputPath: outputPath,
+    });
+
+    expect(renderResponse.isError).toBe(false);
+    const markdown = readFileSync(outputPath, 'utf8');
+    expect(renderResponse.content[0].text).toBe(
+      `${markdown}\n\n**Markdown report:** [Open file](<${outputPath}>)`,
+    );
+    expect(markdown).toContain('**Analysis type:** `failed_result_analysis`');
+    expect(markdown).toContain('**Result assessment:** `inconclusive`');
+    expect(markdown).toContain('**Result-assessment reason:**');
+    expect(markdown).toContain('**Primary category:**');
+    expect(markdown).toContain('`model_reasoning` — 模型理解与决策问题');
+  });
+
+  it('generates the neutral passed-result analysis route', async () => {
+    const [command] = createReportCliCommands();
+    const response = await command.def.handler({
+      action: 'analysis-template',
+      reportStatus: 'pass',
+    });
+    const template = JSON.parse(response.content[0].text);
+
+    expect(template).toMatchObject({
+      analysisType: 'passed_result_analysis',
+      reportStatus: 'pass',
+      resultAssessment: 'inconclusive',
+    });
+    expect(template.resultAssessmentReason).toBeTruthy();
+  });
+
+  it('generates the incomplete-execution analysis route', async () => {
+    const [command] = createReportCliCommands();
+    const templateResponse = await command.def.handler({
+      action: 'analysis-template',
+      reportStatus: 'incomplete',
+    });
+    const template = JSON.parse(templateResponse.content[0].text);
+
+    expect(template).toMatchObject({
+      analysisType: 'incomplete_execution_analysis',
+      reportStatus: 'incomplete',
+      lastTaskStatus: 'running',
+    });
+
+    const resultPath = join(tmpDir, 'incomplete-analysis.json');
+    const outputPath = join(tmpDir, 'incomplete-analysis.md');
+    writeFileSync(resultPath, JSON.stringify(template), 'utf8');
+    await command.def.handler({
+      action: 'render-analysis',
+      analysisResultPath: resultPath,
+      analysisOutputPath: outputPath,
+    });
+
+    expect(readFileSync(outputPath, 'utf8')).toContain(
+      '**Analysis type:** `incomplete_execution_analysis`',
+    );
+  });
+
+  it('allocates paired analysis artifact paths from the HTML filename', async () => {
+    const [command] = createReportCliCommands();
+    const htmlPath = join(tmpDir, 'sample-report.html');
+    writeFileSync(htmlPath, '<html></html>', 'utf8');
+
+    const firstResponse = await command.def.handler({
+      action: 'analysis-template',
+      reportStatus: 'fail',
+      htmlPath,
+      outputDir: tmpDir,
+    });
+    const first = JSON.parse(firstResponse.content[0].text);
+    expect(first).toEqual({
+      analysisResultPath: join(tmpDir, 'sample-report-analysis-json.json'),
+      analysisOutputPath: join(tmpDir, 'sample-report-analysis-result.md'),
+    });
+    expect(
+      JSON.parse(readFileSync(first.analysisResultPath, 'utf8')),
+    ).toMatchObject({ analysisType: 'failed_result_analysis' });
+
+    const secondResponse = await command.def.handler({
+      action: 'analysis-template',
+      reportStatus: 'fail',
+      htmlPath,
+      outputDir: tmpDir,
+    });
+    const second = JSON.parse(secondResponse.content[0].text);
+    expect(second).toEqual({
+      analysisResultPath: join(tmpDir, 'sample-report-analysis-json-1.json'),
+      analysisOutputPath: join(tmpDir, 'sample-report-analysis-result-1.md'),
+    });
+
+    const renderResponse = await command.def.handler({
+      action: 'render-analysis',
+      analysisResultPath: second.analysisResultPath,
+    });
+    expect(existsSync(second.analysisOutputPath)).toBe(true);
+    expect(renderResponse.content[0].text).toBe(
+      `${readFileSync(second.analysisOutputPath, 'utf8')}\n\n**Markdown report:** [Open file](<${second.analysisOutputPath}>)`,
+    );
+  });
+
+  it('validates analysis action parameters', async () => {
+    const [command] = createReportCliCommands();
+    await expect(
+      command.def.handler({ action: 'analysis-template' }),
+    ).rejects.toThrow('report-tool: --reportStatus is required');
+    await expect(
+      command.def.handler({
+        action: 'analysis-template',
+        reportStatus: 'unknown' as never,
+      }),
+    ).rejects.toThrow();
+    await expect(
+      command.def.handler({ action: 'render-analysis' }),
+    ).rejects.toThrow('report-tool: --analysisResultPath is required');
   });
 
   it('runs report split through the generic report command', async () => {
@@ -195,7 +331,7 @@ describe('createReportCliCommands', () => {
   });
 
   it('supports to-markdown via the JS SDK API', async () => {
-    const reportPath = join(tmpDir, 'input-report-sdk-md', 'index.html');
+    const reportPath = join(tmpDir, 'input-report-sdk-md', 'sdk-report.html');
     mkdirSync(join(tmpDir, 'input-report-sdk-md'), { recursive: true });
 
     const screenshot = ScreenshotItem.create(fakeBase64(100), Date.now());
@@ -219,8 +355,8 @@ describe('createReportCliCommands', () => {
       outputDir,
     });
 
-    expect(result.markdownFiles.length).toBe(1);
-    expect(existsSync(join(outputDir, 'report.md'))).toBe(true);
+    expect(result.markdownFiles).toEqual([join(outputDir, 'sdk-report.md')]);
+    expect(existsSync(join(outputDir, 'sdk-report.md'))).toBe(true);
   });
 
   it('throws SDK-friendly validation errors for reportFileToMarkdown', async () => {
@@ -325,7 +461,7 @@ describe('createReportCliCommands', () => {
         outputDir: join(tmpDir, 'unused-output'),
       }),
     ).rejects.toThrow(
-      'report-tool: unsupported --action value "invalid-action". Currently supported: split, to-markdown, merge-html',
+      'report-tool: unsupported --action value "invalid-action". Currently supported: inspect, analysis-template, render-analysis, split, to-markdown, merge-html',
     );
   });
 
@@ -370,7 +506,7 @@ describe('createReportCliCommands', () => {
     expect(result.content[0].text).toContain('Markdown export completed.');
     expect(result.content[0].text).toContain(`Output path: ${outputDir}`);
 
-    const mdContent = readFileSync(join(outputDir, 'report.md'), 'utf-8');
+    const mdContent = readFileSync(join(outputDir, 'index.md'), 'utf-8');
     expect(mdContent).toContain('# markdown-test');
     expect(mdContent).toContain('# execution-exec-md-1');
     expect(mdContent).toContain('# execution-exec-md-2');
@@ -420,7 +556,7 @@ describe('createReportCliCommands', () => {
       action: 'to-markdown',
     });
 
-    const mdContent = readFileSync(join(outputDir, 'report.md'), 'utf-8');
+    const mdContent = readFileSync(join(outputDir, 'index.md'), 'utf-8');
     expect(mdContent).toContain('# execution-exec-md-dedup');
     expect(mdContent).toContain(newScreenshot.id);
     expect(mdContent).not.toContain(oldScreenshot.id);
@@ -476,7 +612,7 @@ describe('createReportCliCommands', () => {
 
     // The markdown must reference the exported (prefixed) file name, not the
     // original source path. See issue #2392.
-    const mdContent = readFileSync(join(outputDir, 'report.md'), 'utf-8');
+    const mdContent = readFileSync(join(outputDir, 'index.md'), 'utf-8');
     expect(mdContent).toContain(
       './screenshots/execution-1-task-1-file-shot.png',
     );
@@ -538,7 +674,7 @@ describe('createReportCliCommands', () => {
 
     // Markdown references the exported copy; the original relative path
     // ./screenshots/rel-shot.png must no longer appear on its own.
-    const mdContent = readFileSync(join(outputDir, 'report.md'), 'utf-8');
+    const mdContent = readFileSync(join(outputDir, 'index.md'), 'utf-8');
     expect(mdContent).toContain(
       './screenshots/execution-1-task-1-rel-shot.png',
     );

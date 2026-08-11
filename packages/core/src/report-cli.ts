@@ -2,9 +2,11 @@ import {
   copyFileSync,
   existsSync,
   mkdirSync,
-  statSync,
+  mkdtempSync,
+  readFileSync,
   writeFileSync,
 } from 'node:fs';
+import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { z } from 'zod';
 import { extractAllDumpScriptsSync } from './dump/html-utils';
@@ -15,6 +17,12 @@ import {
   collectDedupedExecutions,
   splitReportHtmlByExecution,
 } from './report';
+import {
+  getReportAnalysisTemplate,
+  renderReportAnalysisResultMarkdownFile,
+  writeReportAnalysisTemplateFile,
+} from './report-analysis-result';
+import { inspectReport, resolveReportHtmlPath } from './report-inspection';
 import { reportToMarkdown } from './report-markdown';
 import type { MarkdownAttachment } from './report-markdown';
 import type { ReportFileAttributes, TestStatus } from './types';
@@ -42,7 +50,13 @@ export interface ReportCliCommandEntry {
   def: ReportCliCommandDefinition;
 }
 
-export type ConsumeReportFileAction = 'split' | 'to-markdown' | 'merge-html';
+export type ConsumeReportFileAction =
+  | 'inspect'
+  | 'analysis-template'
+  | 'render-analysis'
+  | 'split'
+  | 'to-markdown'
+  | 'merge-html';
 
 export interface ConsumeReportFileOptions {
   htmlPath: string;
@@ -127,7 +141,8 @@ async function markdownFromReport(
   const markdownFiles: string[] = [];
   const writtenScreenshots = new Set<string>();
 
-  const mdPath = path.join(outputDir, 'report.md');
+  const reportBaseName = path.basename(htmlPath, path.extname(htmlPath));
+  const mdPath = path.join(outputDir, `${reportBaseName}.md`);
   writeFileSync(mdPath, result.markdown, 'utf-8');
   markdownFiles.push(mdPath);
 
@@ -145,28 +160,6 @@ async function markdownFromReport(
       .sort()
       .map((f) => path.join(screenshotsDir, f)),
   };
-}
-
-function resolveReportHtmlPath(htmlPath: string): string {
-  const normalizedPath = path.resolve(htmlPath);
-
-  if (!existsSync(normalizedPath)) {
-    throw new Error(`report-tool: --htmlPath does not exist: ${htmlPath}`);
-  }
-
-  const stats = statSync(normalizedPath);
-  if (!stats.isDirectory()) {
-    return normalizedPath;
-  }
-
-  const indexHtmlPath = path.join(normalizedPath, 'index.html');
-  if (!existsSync(indexHtmlPath)) {
-    throw new Error(
-      `report-tool: "${htmlPath}" is not an HTML report file, and no index.html was found under this directory.`,
-    );
-  }
-
-  return indexHtmlPath;
 }
 
 export function splitReportFile(options: SplitReportFileOptions): {
@@ -321,19 +314,42 @@ function normalizeHtmlReportArg(raw: unknown): string[] | undefined {
 const reportCommandDefinition: ReportCliCommandDefinition = {
   name: 'report-tool',
   description:
-    'Transform Midscene report artifacts, including splitting executions, converting to markdown, and merging multiple reports.',
+    'Inspect and transform Midscene report artifacts, including status inspection with Markdown export, analysis-result rendering, splitting executions, converting to markdown, and merging multiple reports.',
   schema: {
     action: z
-      .enum(['split', 'to-markdown', 'merge-html'])
+      .enum([
+        'inspect',
+        'analysis-template',
+        'render-analysis',
+        'split',
+        'to-markdown',
+        'merge-html',
+      ])
       .optional()
       .describe(
-        'Report action to run. Supports: split, to-markdown, merge-html. Defaults to split.',
+        'Report action to run. Supports: inspect, analysis-template, render-analysis, split, to-markdown, merge-html. Defaults to split.',
       ),
     htmlPath: z
       .string()
       .optional()
       .describe(
-        'Input report HTML path (e.g. ./report/index.html). Used by split and to-markdown.',
+        'Input report URL, HTML path, or report directory. Used by inspect, analysis-template, split, and to-markdown; only inspect accepts URLs.',
+      ),
+    reportStatus: z
+      .enum(['pass', 'fail', 'incomplete'])
+      .optional()
+      .describe('Report status for the analysis-template action.'),
+    analysisResultPath: z
+      .string()
+      .optional()
+      .describe(
+        'Analysis-result JSON file to validate and render as Markdown. Use - to read stdin (render-analysis action only).',
+      ),
+    analysisOutputPath: z
+      .string()
+      .optional()
+      .describe(
+        'Output Markdown path for render-analysis. Defaults to the paired analysis-result path for generated analysis-json files, or the input path with an .md extension.',
       ),
     htmlReport: z
       .union([z.string(), z.array(z.string())])
@@ -345,7 +361,7 @@ const reportCommandDefinition: ReportCliCommandDefinition = {
       .string()
       .optional()
       .describe(
-        'Output directory for generated report artifacts. For merge, defaults to the Midscene report directory.',
+        'Output directory for generated report artifacts. Inspect uses a temporary directory when omitted; merge defaults to the Midscene report directory.',
       ),
     outputName: z
       .string()
@@ -364,6 +380,9 @@ const reportCommandDefinition: ReportCliCommandDefinition = {
     const {
       action = 'split',
       htmlPath,
+      reportStatus,
+      analysisResultPath,
+      analysisOutputPath,
       htmlReport,
       outputDir,
       outputName,
@@ -371,19 +390,75 @@ const reportCommandDefinition: ReportCliCommandDefinition = {
     } = args as {
       action?: string;
       htmlPath?: string;
+      reportStatus?: string;
+      analysisResultPath?: string;
+      analysisOutputPath?: string;
       htmlReport?: unknown;
       outputDir?: string;
       outputName?: string;
       overwrite?: unknown;
     };
     if (
+      action !== 'inspect' &&
+      action !== 'analysis-template' &&
+      action !== 'render-analysis' &&
       action !== 'split' &&
       action !== 'to-markdown' &&
       action !== 'merge-html'
     ) {
       throw new Error(
-        `report-tool: unsupported --action value "${action}". Currently supported: split, to-markdown, merge-html`,
+        `report-tool: unsupported --action value "${action}". Currently supported: inspect, analysis-template, render-analysis, split, to-markdown, merge-html`,
       );
+    }
+
+    if (action === 'analysis-template') {
+      if (
+        reportStatus !== 'pass' &&
+        reportStatus !== 'fail' &&
+        reportStatus !== 'incomplete'
+      ) {
+        throw new Error(
+          'report-tool: --reportStatus is required for action "analysis-template" and must be one of: pass, fail, incomplete',
+        );
+      }
+      if (htmlPath) {
+        const paths = writeReportAnalysisTemplateFile(
+          reportStatus,
+          htmlPath,
+          outputDir,
+        );
+        return {
+          isError: false,
+          content: [{ type: 'text', text: JSON.stringify(paths, null, 2) }],
+        };
+      }
+      const template = getReportAnalysisTemplate(reportStatus);
+      return {
+        isError: false,
+        content: [{ type: 'text', text: JSON.stringify(template, null, 2) }],
+      };
+    }
+
+    if (action === 'render-analysis') {
+      if (!analysisResultPath) {
+        throw new Error(
+          'report-tool: --analysisResultPath is required for action "render-analysis"',
+        );
+      }
+      const renderedPath = renderReportAnalysisResultMarkdownFile(
+        analysisResultPath,
+        analysisOutputPath,
+      );
+      const markdown = readFileSync(renderedPath, 'utf8');
+      return {
+        isError: false,
+        content: [
+          {
+            type: 'text',
+            text: `${markdown}\n\n**Markdown report:** [Open file](<${renderedPath.replaceAll('>', '%3E')}>)`,
+          },
+        ],
+      };
     }
 
     if (action === 'merge-html') {
@@ -417,6 +492,33 @@ const reportCommandDefinition: ReportCliCommandDefinition = {
 
     if (!htmlPath) {
       throw new Error('report-tool: --htmlPath is required');
+    }
+
+    if (action === 'inspect') {
+      const inspection = await inspectReport({ report: htmlPath });
+      const result = {
+        ...inspection,
+        markdownFiles: [] as string[],
+      };
+
+      const markdownOutputDir = outputDir
+        ? path.resolve(outputDir)
+        : mkdtempSync(path.join(tmpdir(), 'midscene-report-inspect-'));
+      const markdownResult = await reportFileToMarkdown({
+        htmlPath: inspection.localReport,
+        outputDir: markdownOutputDir,
+      });
+      result.markdownFiles = markdownResult.markdownFiles;
+
+      return {
+        isError: false,
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
     }
 
     if (!outputDir) {
